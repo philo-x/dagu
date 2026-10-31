@@ -100,7 +100,10 @@ func TestRealV2Run(t *testing.T) {
 	t.Setenv("OPENCODE_DISABLE_MODELS_FETCH", "1")
 	settings := map[string]any{"model": "dagutest/test", "providers": map[string]any{"dagutest": map[string]any{"package": "@ai-sdk/openai-compatible", "settings": map[string]any{"baseURL": provider.URL + "/v1", "apiKey": "local-test"}, "models": map[string]any{"test": map[string]any{"name": "test"}}}}}
 	settings["permissions"] = []any{map[string]any{"action": "question", "resource": "*", "effect": "ask"}}
-	settings["commands"] = map[string]any{"smoke": map[string]any{"template": "Reply to $ARGUMENTS"}}
+	settings["commands"] = map[string]any{
+		"smoke": map[string]any{"template": "Reply to $ARGUMENTS"},
+		"slow":  map[string]any{"template": "Reply to !`sleep 31; printf slow-command` $ARGUMENTS"},
+	}
 	content, err := json.Marshal(settings)
 	require.NoError(t, err)
 	t.Setenv("OPENCODE_CONFIG_CONTENT", string(content))
@@ -114,7 +117,7 @@ func TestRealV2Run(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "2.1.4", hostConfig.Version)
 	executor := &harnessExecutor{prompt: "Reply with the test marker", workDir: root}
-	ctx, cancel := context.WithTimeout(runtime.WithEnv(t.Context(), runtime.Env{}), 30*time.Second)
+	ctx, cancel := context.WithTimeout(runtime.WithEnv(t.Context(), runtime.Env{}), 90*time.Second)
 	defer cancel()
 	stdout, err := executor.runManagedOpenCode(ctx, providerConfig{flags: map[string]any{"model": "dagutest/test"}}, hostConfig)
 	require.NoError(t, err)
@@ -129,6 +132,21 @@ func TestRealV2Run(t *testing.T) {
 	commandText, err := io.ReadAll(commandOutput)
 	require.NoError(t, err)
 	require.Contains(t, string(commandText), "DAGU_V2_OK")
+	slowExecutor := &harnessExecutor{prompt: "slow command marker", workDir: root}
+	slowOutput, err := slowExecutor.runManagedOpenCode(ctx, providerConfig{flags: map[string]any{"command": "slow"}}, hostConfig)
+	require.NoError(t, err)
+	defer cleanupStdoutSpool(slowOutput)
+	slowText, err := io.ReadAll(slowOutput)
+	require.NoError(t, err)
+	require.Contains(t, string(slowText), "DAGU_V2_OK")
+	missingExecutor := &harnessExecutor{prompt: "unknown command", workDir: root}
+	missingOutput, err := missingExecutor.runManagedOpenCode(ctx, providerConfig{flags: map[string]any{"command": "dagu_missing_command"}}, hostConfig)
+	require.ErrorContains(t, err, "CommandNotFoundError")
+	require.Nil(t, missingOutput)
+	require.Equal(t, ir.AgentSessionFailed, missingExecutor.agentSession.State)
+	available, err := opencodehost.SessionAvailable(ctx, hostConfig, root, missingExecutor.agentSession.SessionID)
+	require.NoError(t, err)
+	require.True(t, available, "an unknown command must not make the session unavailable")
 	askQuestion.Store(true)
 	questionExecutor := &harnessExecutor{prompt: "Ask which branch to use", workDir: root}
 	waitingOutput, err := questionExecutor.runManagedOpenCode(ctx, providerConfig{flags: map[string]any{"model": "dagutest/test"}}, hostConfig)
@@ -154,7 +172,7 @@ func TestRealV2Run(t *testing.T) {
 	resumedText, err := io.ReadAll(resumedOutput)
 	require.NoError(t, err)
 	require.Contains(t, string(resumedText), "DAGU_V2_OK")
-	available, err := opencodehost.SessionAvailable(ctx, hostConfig, root, executor.agentSession.SessionID)
+	available, err = opencodehost.SessionAvailable(ctx, hostConfig, root, executor.agentSession.SessionID)
 	require.NoError(t, err)
 	require.True(t, available)
 	require.NoError(t, opencodehost.DeleteSession(ctx, hostConfig, root, executor.agentSession.SessionID))
@@ -186,6 +204,23 @@ func TestV2Messages(t *testing.T) {
 	}{Type: "APIError", Message: "model failed"}
 	_, _, err = managedOpenCodeResult(normalizeV2Messages(messages), "msg_prompt")
 	require.EqualError(t, err, "model failed")
+}
+
+func TestV2Snapshot(t *testing.T) {
+	var messages []openCodeV2Message
+	require.NoError(t, json.Unmarshal([]byte(`[
+ {"id":"msg_prompt","type":"user","text":"edit"},
+ {"id":"msg_answer","type":"assistant","finish":"stop","time":{"completed":1},"content":[{"type":"text","text":"edited"}],"snapshot":{"files":["image.png","main.go"]}}
+ ]`), &messages))
+	chat, events, _, _ := normalizeOpenCodeMessages(normalizeV2Messages(messages))
+	require.Len(t, chat, 2)
+	var files []string
+	for _, event := range events {
+		files = append(files, event.Files...)
+	}
+	require.Equal(t, []string{"image.png", "main.go"}, files)
+	_, repeated, _, _ := normalizeOpenCodeMessages(normalizeV2Messages(messages))
+	require.Equal(t, events[len(events)-1].ID, repeated[len(repeated)-1].ID)
 }
 
 func TestV2Pagination(t *testing.T) {
@@ -292,7 +327,14 @@ func TestV2PermissionEvent(t *testing.T) {
 }
 
 func TestV2MissingInteraction(t *testing.T) {
-	server := httptest.NewServer(http.NotFoundHandler())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		if r.URL.Path == "/api/session/ses_test" {
+			_, _ = io.WriteString(w, `{"_tag":"SessionNotFoundError"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"_tag":"FormNotFoundError"}`)
+	}))
 	defer server.Close()
 	c := &openCodeClient{host: opencodehost.Config{URL: server.URL, Version: "2.1.4"}, sessionID: "ses_test", http: server.Client()}
 	for _, path := range []string{"/session/ses_test/permission/req/reply", "/session/ses_test/form/req", "/session/ses_test/form/req/reply"} {
@@ -301,6 +343,76 @@ func TestV2MissingInteraction(t *testing.T) {
 		require.NotErrorIs(t, err, errManagedSessionUnavailable)
 	}
 	require.ErrorIs(t, c.json(t.Context(), http.MethodGet, "/session/ses_test", nil, nil), errManagedSessionUnavailable)
+}
+
+func TestV2NotFound(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		path        string
+		body        string
+		unavailable bool
+	}{
+		{"command", "/session/ses_test/command", `{"_tag":"CommandNotFoundError"}`, false},
+		{"model", "/session/ses_test/model", `{"_tag":"ModelNotFoundError"}`, false},
+		{"location", "/session/ses_test", `{"_tag":"LocationNotFoundError"}`, false},
+		{"session", "/session/ses_test/command", `{"_tag":"SessionNotFoundError"}`, true},
+		{"interaction_session", "/session/ses_test/form/req/reply", `{"_tag":"SessionNotFoundError"}`, true},
+		{"malformed", "/session/ses_test/command", `<html>Not found</html>`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			client := &openCodeClient{host: opencodehost.Config{URL: server.URL, Version: "2.1.4"}, http: server.Client()}
+			err := client.postNoContent(t.Context(), tc.path, nil)
+			require.Error(t, err)
+			_, historyErr := client.messages(t.Context(), "ses_test")
+			require.Error(t, historyErr)
+			if tc.unavailable {
+				require.ErrorIs(t, err, errManagedSessionUnavailable)
+				require.ErrorIs(t, historyErr, errManagedSessionUnavailable)
+				return
+			}
+			require.NotErrorIs(t, err, errManagedSessionUnavailable)
+			require.NotErrorIs(t, historyErr, errManagedSessionUnavailable)
+		})
+	}
+}
+
+func TestV2SlowCommand(t *testing.T) {
+	var submitted atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/session/ses_test/command":
+			time.Sleep(150 * time.Millisecond)
+			submitted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/session/ses_test/inbox":
+			if submitted.Load() {
+				_, _ = io.WriteString(w, `{"data":[{"id":"msg_command","type":"user"}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		case "/api/session/ses_test/message":
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		case "/api/session/ses_test/interrupt":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := &openCodeClient{host: opencodehost.Config{URL: server.URL, Version: "2.1.4"}, http: server.Client()}
+	client.http.Timeout = 50 * time.Millisecond
+	executor := &harnessExecutor{agentSession: &ir.AgentSession{}}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := executor.submitManagedPromptV2(ctx, client, providerConfig{flags: map[string]any{"command": "slow"}}, "ses_test", "msg_test", nil)
+	require.NoError(t, err)
+	require.True(t, submitted.Load())
+	require.Equal(t, "msg_command", executor.agentSession.PromptMessageID)
 }
 
 func TestV2CommandCancellation(t *testing.T) {
@@ -329,4 +441,36 @@ func TestV2CommandCancellation(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, submitted.Load())
 	require.True(t, interrupted.Load(), "accepted command must be interrupted even after caller cancellation")
+}
+
+func TestV2AdmittedCancellation(t *testing.T) {
+	var submitted, interrupted atomic.Bool
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/session/ses_test/command":
+			submitted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/session/ses_test/inbox":
+			if submitted.Load() {
+				cancel()
+			}
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		case "/api/session/ses_test/message":
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		case "/api/session/ses_test/interrupt":
+			interrupted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := &openCodeClient{host: opencodehost.Config{URL: server.URL, Version: "2.1.4"}, http: server.Client()}
+	executor := &harnessExecutor{agentSession: &ir.AgentSession{}}
+	err := executor.submitManagedPromptV2(ctx, client, providerConfig{flags: map[string]any{"command": "slow"}}, "ses_test", "msg_test", nil)
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, submitted.Load())
+	require.True(t, interrupted.Load())
 }

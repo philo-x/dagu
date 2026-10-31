@@ -149,12 +149,8 @@ func (c *openCodeClient) json(ctx context.Context, method, path string, body, ta
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound && strings.HasPrefix(path, "/session/") &&
-		(!c.host.IsV2() || (!strings.Contains(path, "/permission/") && !strings.Contains(path, "/form/"))) {
-		return errManagedSessionUnavailable
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("OpenCode API %s %s returned %s", method, path, resp.Status)
+		return c.apiError(resp, method, path)
 	}
 	if target == nil || resp.StatusCode == http.StatusNoContent {
 		return nil
@@ -175,6 +171,26 @@ func (c *openCodeClient) json(ctx context.Context, method, path string, body, ta
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(target)
+}
+
+func (c *openCodeClient) apiError(resp *http.Response, method, path string) error {
+	if resp.StatusCode != http.StatusNotFound || !strings.HasPrefix(path, "/session/") {
+		return fmt.Errorf("OpenCode API %s %s returned %s", method, path, resp.Status)
+	}
+	if !c.host.IsV2() {
+		return errManagedSessionUnavailable
+	}
+	// V2 session routes can also return missing command, model, or form errors.
+	var failure struct {
+		Tag string `json:"_tag"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&failure); err != nil {
+		return fmt.Errorf("OpenCode API %s %s returned %s with an invalid error response: %w", method, path, resp.Status, err)
+	}
+	if failure.Tag == "SessionNotFoundError" {
+		return errManagedSessionUnavailable
+	}
+	return fmt.Errorf("OpenCode API %s %s returned %s (%s)", method, path, resp.Status, failure.Tag)
 }
 
 func (c *openCodeClient) postNoContent(ctx context.Context, path string, body any) error {
