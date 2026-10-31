@@ -306,7 +306,10 @@ func (n *Node) runCommand(ctx context.Context, cmd executor.Executor, stepTimeou
 
 		// Check if this is a timeout error
 		if stepTimeout > 0 && (errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded || elapsed >= stepTimeout) {
-			return n.handleTimeout(ctx, step, stepTimeout, elapsed)
+			code, timeoutErr := n.handleTimeout(ctx, step, stepTimeout, elapsed)
+			failure := errors.Join(timeoutErr, err)
+			n.SetError(failure)
+			return code, failure
 		}
 
 		return n.handleCommandError(cmd, err)
@@ -1234,6 +1237,14 @@ func (n *Node) Stop(ctx context.Context, intent cmdutil.TerminationIntent, allow
 	stopIntent := n.stopIntentToSend(intent, allowOverride)
 	isTermination := stopIntent.IsTermination()
 	if isTermination {
+		session := n.GetAgentSession()
+		if session != nil && session.Provider == "opencode" && session.State != ir.AgentSessionSucceeded &&
+			session.CleanupStatus != "verified" && !session.CleanupBlocksExecution() {
+			// Publish the fence with local cancellation, before Stop or progress
+			// persistence can block. Setup cancellation still admits no remote abort.
+			session.CleanupStatus = "requested"
+			n.SetAgentSession(session)
+		}
 		n.SetStatus(ir.NodeAborted)
 	}
 	cancel := n.execCancel
@@ -1256,7 +1267,18 @@ func (n *Node) Stop(ctx context.Context, intent cmdutil.TerminationIntent, allow
 		tag.Signal(stopIntent.SignalName()),
 		tag.Step(n.Name()),
 	)
-	if err := stopExecutor(cmd, stopIntent); err != nil {
+	err := stopExecutor(cmd, stopIntent)
+	if isTermination {
+		if handler, ok := cmd.(executor.AgentSessionHandler); ok {
+			// Stop can time out while progress persistence is stalled. Capture its
+			// fence directly so retries cannot discard the unresolved owner.
+			session := handler.GetAgentSession()
+			n.mu.Lock()
+			n.SetAgentSession(session)
+			n.mu.Unlock()
+		}
+	}
+	if err != nil {
 		logger.Error(ctx, "Failed to stop step",
 			tag.Error(err),
 			tag.Step(n.Name()),

@@ -311,14 +311,15 @@ func (c *openCodeClient) rejectQuestion(ctx context.Context, requestID string) e
 }
 
 func (c *openCodeClient) abort(ctx context.Context, sessionID string) error {
-	return c.json(ctx, http.MethodPost, "/session/"+url.PathEscape(sessionID)+"/abort", nil, nil)
+	_, err := c.interrupt(ctx, sessionID)
+	return err
 }
 
 func abortManagedOpenCode(ctx context.Context, host opencodehost.Config, sessionID, directory string) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	client := &openCodeClient{host: host, directory: directory, http: newOpenCodeHTTPClient(3 * time.Second)}
-	return client.abort(ctx, sessionID)
+	return errors.Join(client.abort(ctx, sessionID), client.awaitIdle(ctx, sessionID))
 }
 
 func (c *openCodeClient) subscribe(ctx context.Context) (<-chan openCodeEvent, <-chan error, func(), error) {

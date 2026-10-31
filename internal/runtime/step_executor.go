@@ -51,6 +51,10 @@ func (e *StepExecutor) ExecuteWithProgress(ctx context.Context, node *Node, onSe
 }
 
 func (e *StepExecutor) execute(ctx context.Context, node *Node, onSetup []func(), onProgress func()) error {
+	if node.GetAgentSession().CleanupBlocksExecution() {
+		node.SetError(ir.ErrAgentCleanupUnverified)
+		return ir.ErrAgentCleanupUnverified
+	}
 	attemptStarted := time.Now()
 	node.SetStatusDetails(nil)
 	ctx, cancel, stepTimeout := node.setupContextWithTimeout(ctx)
@@ -220,7 +224,17 @@ func (e *StepExecutor) captureLiveExecutorSideChannels(cmd executor.Executor, no
 		node.SetChatMessages(chatHandler.GetMessages())
 	}
 	if agentHandler, ok := cmd.(executor.AgentSessionHandler); ok {
-		node.SetAgentSession(agentHandler.GetAgentSession())
+		session := agentHandler.GetAgentSession()
+		node.mu.Lock()
+		defer node.mu.Unlock()
+		existing := node.GetAgentSession()
+		// A progress snapshot taken before Stop must not erase its deadline fence.
+		if existing.CleanupBlocksExecution() &&
+			(session == nil || (session.SessionID == existing.SessionID && session.Generation == existing.Generation)) &&
+			(existing.CleanupStatus == "unverified" || !session.CleanupBlocksExecution()) {
+			return
+		}
+		node.SetAgentSession(session)
 	}
 }
 

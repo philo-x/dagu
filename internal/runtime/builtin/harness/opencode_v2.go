@@ -78,16 +78,7 @@ func (e *harnessExecutor) submitManagedPromptV2(ctx context.Context, c *openCode
 		if err != nil {
 			return err
 		}
-		admitted := false
-		defer func() {
-			if !admitted {
-				// The server may accept a command before the caller observes a failure.
-				abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-				defer cancel()
-				_ = c.abort(abortCtx, sessionID)
-			}
-		}()
-		if err := c.postNoContent(ctx, base+"/command", body); err != nil {
+		if err := e.postManagedInput(ctx, c, base+"/command", body); err != nil {
 			return err
 		}
 		// V2 commands return no content. Find the user input admitted by the
@@ -107,7 +98,6 @@ func (e *harnessExecutor) submitManagedPromptV2(ctx context.Context, c *openCode
 					e.mu.Lock()
 					e.agentSession.PromptMessageID = id
 					e.mu.Unlock()
-					admitted = true
 					return nil
 				}
 			}
@@ -118,7 +108,7 @@ func (e *harnessExecutor) submitManagedPromptV2(ctx context.Context, c *openCode
 			}
 		}
 	}
-	return c.postNoContent(ctx, base+"/prompt", body)
+	return e.postManagedInput(ctx, c, base+"/prompt", body)
 }
 
 type openCodeV2Message struct {

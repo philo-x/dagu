@@ -640,6 +640,9 @@ func toAgentSession(session *ir.AgentSession) *api.AgentSession {
 	return &api.AgentSession{
 		Provider: session.Provider, ProviderVersion: ptrOf(session.ProviderVersion), SessionId: ptrOf(session.SessionID), Generation: ptrOf(session.Generation),
 		Agent: ptrOf(session.Agent), Model: ptrOf(session.Model), Variant: ptrOf(session.Variant),
+		OwnerWorkerId: ptrOf(session.OwnerWorkerID), HostInstanceId: ptrOf(session.HostInstanceID), Directory: ptrOf(session.Directory), OwnerPid: ptrOf(session.OwnerPID),
+		CleanupStatus: ptrOf(session.CleanupStatus), CleanupAcknowledged: ptrOf(session.CleanupAcknowledged), CleanupInterrupted: ptrOf(session.CleanupInterrupted),
+		CleanupInterruptError: ptrOf(session.CleanupInterruptError), CleanupIdleError: ptrOf(session.CleanupIdleError),
 		State:     api.AgentSessionState(session.State),
 		LastError: ptrOf(session.LastError), Interactions: ptrOf(interactions), Events: ptrOf(events),
 		Usage: &api.AgentUsage{

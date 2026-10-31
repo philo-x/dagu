@@ -34,18 +34,63 @@ const (
 )
 
 func (e *harnessExecutor) runManagedOpenCode(
-	ctx context.Context,
+	parent context.Context,
 	cfg providerConfig,
 	host opencodehost.Config,
-) (*os.File, error) {
+) (stdout *os.File, runErr error) {
+	ctx, cancel := context.WithCancel(parent)
+	turn := &managedTurn{cancel: cancel, done: make(chan struct{})}
 	client := &openCodeClient{host: host, directory: e.workDir, http: newOpenCodeHTTPClient(30 * time.Second)}
 	e.mu.Lock()
+	if e.agentSession.CleanupBlocksExecution() {
+		e.mu.Unlock()
+		cancel()
+		return nil, ir.ErrAgentCleanupUnverified
+	}
+	if e.agentSession != nil && e.agentSession.PromptSent && e.agentSession.SessionID != "" &&
+		e.agentSession.CleanupStatus != "verified" && e.agentSession.State != ir.AgentSessionSucceeded &&
+		((e.agentSession.HostInstanceID != "" && e.agentSession.HostInstanceID != host.InstanceID) ||
+			(e.agentSession.OwnerWorkerID != "" && e.agentSession.OwnerWorkerID != runtimeWorkerID(parent)) ||
+			(e.agentSession.Directory != "" && filepath.Clean(e.agentSession.Directory) != filepath.Clean(e.workDir))) {
+		e.agentSession.CleanupStatus = "unverified"
+		e.agentSession.CleanupIdleError = "Original OpenCode execution owner is unavailable"
+		e.appendAgentEventLocked("cleanup", "unverified", "Cannot reconcile foreground execution on a replacement OpenCode host")
+		e.mu.Unlock()
+		cancel()
+		e.notifyProgress()
+		return nil, ir.ErrAgentCleanupUnverified
+	}
+	if e.managedTurn != nil {
+		e.mu.Unlock()
+		cancel()
+		return nil, errors.New("managed OpenCode execution is still active")
+	}
+	if e.agentSession != nil && e.agentSession.PromptSent && e.agentSession.CleanupStatus != "verified" &&
+		(e.agentSession.State == ir.AgentSessionFailed || e.agentSession.State == ir.AgentSessionAborted) {
+		e.agentSession.CleanupStatus = "unverified"
+		e.agentSession.CleanupIdleError = "Prior failed OpenCode execution has no settlement evidence"
+		e.appendAgentEventLocked("cleanup", "unverified", e.agentSession.CleanupIdleError)
+		e.mu.Unlock()
+		cancel()
+		e.notifyProgress()
+		return nil, ir.ErrAgentCleanupUnverified
+	}
+	e.managedTurn = turn
+	if e.agentSession != nil && e.agentSession.PromptSent {
+		turn.submitted = true
+		client.sessionID = e.agentSession.SessionID
+	}
+	if e.stopRequested {
+		cancel()
+	}
 	e.managedHost = host
 	e.hasDeterminedStatus = false
 	if e.agentSession == nil {
 		e.agentSession = &ir.AgentSession{Provider: "opencode", Generation: 1}
 	} else if e.agentSession.PromptSent && (e.agentSession.State == ir.AgentSessionFailed || e.agentSession.State == ir.AgentSessionAborted) {
 		e.agentSession.StartNewGeneration()
+		turn.submitted = false
+		client.sessionID = ""
 		e.contextMessages = nil
 		e.savedMessages = []ir.LLMMessage{}
 	}
@@ -63,6 +108,52 @@ func (e *harnessExecutor) runManagedOpenCode(
 	e.agentSession.State = ir.AgentSessionStarting
 	e.appendAgentEventLocked("lifecycle", "starting", "OpenCode session starting")
 	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		cause := ctx.Err()
+		canceled := !turn.terminal && cause != nil
+		submitted := turn.submitted
+		cleanupRequired := turn.cleanupRequired
+		if !canceled && !turn.terminal && submitted && (runErr != nil || e.agentSession.State == ir.AgentSessionUnavailable) && e.agentSession.CleanupStatus != "verified" {
+			// Monitoring/setup failure cannot establish remote idleness. Retain the
+			// owner for reconciliation rather than admitting fallback or a new turn.
+			e.agentSession.CleanupStatus = "unverified"
+			runErr = errors.Join(runErr, ir.ErrAgentCleanupUnverified)
+		}
+		e.mu.Unlock()
+		if canceled || cleanupRequired {
+			if stdout != nil {
+				_ = cleanupStdoutSpool(stdout)
+				stdout = nil
+			}
+			if submitted {
+				err := e.reconcileManagedCancellation(client, client.sessionID, turn)
+				e.mu.Lock()
+				turn.cleanupErr = errors.Join(turn.cleanupErr, err)
+				e.mu.Unlock()
+			}
+			e.mu.Lock()
+			runErr = errors.Join(cause, runErr, turn.cleanupErr)
+			e.hasDeterminedStatus = false
+			if canceled {
+				e.agentSession.State = ir.AgentSessionAborted
+				e.agentSession.LastError = runErr.Error()
+				e.appendAgentEventLocked("lifecycle", "aborted", "Local execution cancelled; consult cleanup events for owner-scoped settlement")
+			}
+			e.mu.Unlock()
+		}
+		e.mu.Lock()
+		turn.terminal = true
+		close(turn.done)
+		e.mu.Unlock()
+		cancel()
+		e.notifyProgress()
+		e.mu.Lock()
+		if e.managedTurn == turn {
+			e.managedTurn = nil
+		}
+		e.mu.Unlock()
+	}()
 	e.notifyProgress()
 
 	files, err := managedFileParts(client.directory, cfg.flags["file"])
@@ -82,7 +173,23 @@ func (e *harnessExecutor) runManagedOpenCode(
 	client.sessionID = sessionID
 	e.mu.Lock()
 	e.agentSession.RestartPending = false
+	turn.submitted = e.agentSession.PromptSent
 	e.mu.Unlock()
+	if host.IsV2() {
+		pid, err := client.ownerPID(ctx)
+		if err != nil {
+			return e.finishManagedError(err)
+		}
+		e.mu.Lock()
+		if e.agentSession.PromptSent && e.agentSession.OwnerPID != 0 && e.agentSession.OwnerPID != pid {
+			e.agentSession.CleanupStatus = "unverified"
+			e.agentSession.CleanupIdleError = "Original OpenCode execution process changed"
+			e.mu.Unlock()
+			return nil, ir.ErrAgentCleanupUnverified
+		}
+		e.agentSession.OwnerPID = pid
+		e.mu.Unlock()
+	}
 
 	events, eventErrs, closeEvents, err := client.subscribe(ctx)
 	if err != nil {
@@ -97,6 +204,7 @@ func (e *harnessExecutor) runManagedOpenCode(
 
 	e.mu.Lock()
 	promptSent := e.agentSession.PromptSent
+	turn.submitted = promptSent
 	promptMessageID := e.agentSession.PromptMessageID
 	e.mu.Unlock()
 	if promptSent && promptMessageID == "" {
@@ -123,7 +231,11 @@ func (e *harnessExecutor) runManagedOpenCode(
 		}
 		commandErrs, err = e.submitManagedPrompt(ctx, client, cfg, sessionID, promptMessageID, files)
 		if err != nil {
-			return e.finishManagedError(err)
+			e.mu.Lock()
+			turn.cleanupRequired = turn.submitted
+			e.mu.Unlock()
+			e.failManagedSession(err)
+			return nil, err
 		}
 		e.mu.Lock()
 		e.agentSession.PromptSent = true
@@ -140,10 +252,6 @@ func (e *harnessExecutor) runManagedOpenCode(
 	for {
 		select {
 		case <-ctx.Done():
-			abortCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = client.abort(abortCtx, sessionID)
-			cancel()
-			e.setManagedState(ir.AgentSessionAborted, "aborted", "OpenCode session aborted")
 			return nil, ctx.Err()
 		case err, ok := <-eventErrs:
 			if !ok {
@@ -299,6 +407,11 @@ func (e *harnessExecutor) submitManagedPrompt(ctx context.Context, client *openC
 	parts = append(parts, files...)
 
 	if command := stringFlag(cfg.flags, "command"); command != "" {
+		e.mu.Lock()
+		if e.managedTurn != nil {
+			e.managedTurn.submitted = true
+		}
+		e.mu.Unlock()
 		return client.commandAsync(ctx, sessionID, messageID, command, e.effectivePrompt(), cfg, files), nil
 	}
 	body := map[string]any{"messageID": messageID, "parts": parts}
@@ -315,7 +428,7 @@ func (e *harnessExecutor) submitManagedPrompt(ctx context.Context, client *openC
 	if variant := stringFlag(cfg.flags, "variant"); variant != "" {
 		body["variant"] = variant
 	}
-	return nil, client.postNoContent(ctx, "/session/"+url.PathEscape(sessionID)+"/prompt_async", body)
+	return nil, e.postManagedInput(ctx, client, "/session/"+url.PathEscape(sessionID)+"/prompt_async", body)
 }
 
 func managedFileParts(workDir string, value any) ([]map[string]any, error) {
@@ -521,6 +634,10 @@ func (e *harnessExecutor) finishManagedWaiting(message string) (*os.File, error)
 
 func (e *harnessExecutor) finishManagedUnavailable(message string) (*os.File, error) {
 	e.mu.Lock()
+	if e.managedTurn != nil && e.managedTurn.submitted && e.agentSession.CleanupStatus != "verified" {
+		e.agentSession.CleanupStatus = "unverified"
+		e.agentSession.CleanupIdleError = "OpenCode execution owner is unavailable"
+	}
 	e.agentSession.State = ir.AgentSessionUnavailable
 	e.agentSession.LastError = message
 	e.determinedStatus = ir.NodeWaiting
@@ -536,7 +653,32 @@ func (e *harnessExecutor) finishManagedSuccess(ctx context.Context, client *open
 	if err != nil {
 		return e.finishManagedError(err)
 	}
+	settle, cancel := context.WithTimeout(ctx, managedCleanupBudget)
+	defer cancel()
+	if err := client.awaitIdle(settle, sessionID); err != nil {
+		return e.finishManagedError(err)
+	}
+	if client.host.IsV2() {
+		pid, err := client.ownerPID(settle)
+		if err != nil {
+			return e.finishManagedError(err)
+		}
+		e.mu.Lock()
+		owner := e.agentSession.OwnerPID
+		e.mu.Unlock()
+		if owner == 0 || owner != pid {
+			return e.finishManagedError(errors.New("OpenCode execution owner changed"))
+		}
+	}
 	e.mu.Lock()
+	if ctx.Err() != nil {
+		e.mu.Unlock()
+		return nil, ctx.Err()
+	}
+	e.agentSession.CleanupStatus = "verified"
+	if e.managedTurn != nil {
+		e.managedTurn.terminal = true
+	}
 	promptMessageID := e.agentSession.PromptMessageID
 	lastError := e.agentSession.LastError
 	e.mu.Unlock()
@@ -551,7 +693,14 @@ func (e *harnessExecutor) finishManagedSuccess(ctx context.Context, client *open
 		return e.finishManagedError(errors.New(lastError))
 	}
 	e.mu.Lock()
+	if e.managedTurn != nil && ctx.Err() != nil {
+		e.mu.Unlock()
+		return nil, ctx.Err()
+	}
 	e.agentSession.State = ir.AgentSessionSucceeded
+	if e.managedTurn != nil {
+		e.managedTurn.terminal = true
+	}
 	e.agentSession.LastError = ""
 	e.determinedStatus = ir.NodeSucceeded
 	e.hasDeterminedStatus = true
@@ -582,6 +731,10 @@ func managedStdout(content string) (*os.File, error) {
 func (e *harnessExecutor) failManagedSession(err error) {
 	e.mu.Lock()
 	if e.agentSession != nil {
+		if e.managedTurn != nil && e.managedTurn.submitted && !e.managedTurn.terminal && e.agentSession.CleanupStatus != "verified" {
+			e.agentSession.CleanupStatus = "unverified"
+			e.agentSession.CleanupIdleError = "OpenCode foreground execution must be reconciled after failure"
+		}
 		e.agentSession.State = ir.AgentSessionFailed
 		e.agentSession.LastError = err.Error()
 		e.appendAgentEventLocked("lifecycle", "failed", err.Error())

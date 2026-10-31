@@ -304,29 +304,15 @@ func TestV2MissingInteraction(t *testing.T) {
 }
 
 func TestV2CommandCancellation(t *testing.T) {
-	var submitted, interrupted atomic.Bool
-	ctx, cancel := context.WithCancel(t.Context())
+	fixture := newCancellationFixture(t)
+	ctx, cancel := context.WithCancel(runtime.WithEnv(t.Context(), runtime.Env{}))
 	defer cancel()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/session/ses_test/command":
-			submitted.Store(true)
-			cancel()
-			w.WriteHeader(http.StatusNoContent)
-		case "/api/session/ses_test/interrupt":
-			interrupted.Store(true)
-			w.WriteHeader(http.StatusNoContent)
-		case "/api/session/ses_test/inbox", "/api/session/ses_test/message":
-			_, _ = w.Write([]byte(`{"data":[]}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	c := &openCodeClient{host: opencodehost.Config{URL: server.URL, Version: "2.1.4"}, http: server.Client()}
-	e := &harnessExecutor{}
-	err := e.submitManagedPromptV2(ctx, c, providerConfig{flags: map[string]any{"command": "slow"}}, "ses_test", "msg_test", nil)
-	require.Error(t, err)
-	require.True(t, submitted.Load())
-	require.True(t, interrupted.Load(), "accepted command must be interrupted even after caller cancellation")
+	fixture.input = func(w http.ResponseWriter, _ *http.Request) {
+		cancel()
+		w.WriteHeader(http.StatusNoContent)
+	}
+	_, err := fixture.executor.runManagedOpenCode(ctx, providerConfig{flags: map[string]any{"command": "slow"}}, fixture.host)
+	require.ErrorIs(t, err, context.Canceled)
+	require.EqualValues(t, 1, fixture.interrupts.Load())
+	require.Equal(t, "verified", fixture.executor.GetAgentSession().CleanupStatus)
 }

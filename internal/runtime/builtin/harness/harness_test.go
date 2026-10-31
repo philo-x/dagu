@@ -283,6 +283,8 @@ func TestManagedOpenCodeRetryUsesNewSessionGeneration(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/config":
 			_, _ = io.WriteString(w, `{"share":"disabled"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/session/status":
+			_, _ = io.WriteString(w, `{}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/session":
 			mu.Lock()
 			created++
@@ -438,6 +440,10 @@ func TestOpenCodeConnSurvivesTransportReset(t *testing.T) {
 		mu.Lock()
 		remoteAddrs = append(remoteAddrs, r.RemoteAddr)
 		mu.Unlock()
+		if r.URL.Path == "/session/status" {
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(server.Close)
@@ -449,8 +455,8 @@ func TestOpenCodeConnSurvivesTransportReset(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Len(t, remoteAddrs, 2)
-	assert.Equal(t, remoteAddrs[0], remoteAddrs[1])
+	require.Len(t, remoteAddrs, 4)
+	assert.Equal(t, remoteAddrs[0], remoteAddrs[2])
 }
 
 func TestManagedOpenCodeCleanRestartCreatesNewSession(t *testing.T) {
@@ -521,13 +527,14 @@ func TestManagedOpenCodeTransportLossWaitsForRestart(t *testing.T) {
 		URL: server.URL, Password: "test", InstanceID: "host-1",
 	})
 
-	require.NoError(t, err)
-	require.NoError(t, cleanupStdoutSpool(stdout))
+	require.ErrorIs(t, err, ir.ErrAgentCleanupUnverified)
+	require.Nil(t, stdout)
 	require.NotNil(t, exec.agentSession)
-	assert.Equal(t, ir.AgentSessionUnavailable, exec.agentSession.State)
+	assert.Equal(t, "unverified", exec.agentSession.CleanupStatus)
+	assert.Equal(t, "session-1", exec.agentSession.SessionID)
 	status, err := exec.DetermineNodeStatus()
 	require.NoError(t, err)
-	assert.Equal(t, ir.NodeWaiting, status)
+	assert.Equal(t, ir.NodeRunning, status)
 }
 
 func TestManagedOpenCodeRefreshUpdatesTimeline(t *testing.T) {

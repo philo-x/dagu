@@ -51,6 +51,9 @@ type agentSessionActionError struct {
 func (e *agentSessionActionError) Error() string { return e.message }
 
 func classifyAgentSessionAction(err error) agentSessionActionClass {
+	if errors.Is(err, ir.ErrAgentCleanupUnverified) {
+		return agentSessionActionConflict
+	}
 	var actionErr *agentSessionActionError
 	if !errors.As(err, &actionErr) {
 		return agentSessionActionBadRequest
@@ -597,6 +600,9 @@ func applyAgentSessionRestart(node *ir.Node) error {
 		return errors.New("managed-agent step is still running")
 	}
 	session := node.AgentSession
+	if session.CleanupBlocksExecution() {
+		return ir.ErrAgentCleanupUnverified
+	}
 	if !agentProviderRestartable(session.Provider) {
 		return fmt.Errorf("%s sessions cannot be restarted", agentProviderLabel(session.Provider))
 	}

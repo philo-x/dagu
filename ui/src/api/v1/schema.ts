@@ -6352,6 +6352,19 @@ export interface components {
             agent?: string;
             model?: string;
             variant?: string;
+            /** @description Worker owning this session's foreground execution */
+            ownerWorkerId?: string;
+            /** @description Managed host owning this session's foreground execution */
+            hostInstanceId?: string;
+            directory?: string;
+            /** @description Owning OpenCode server process, not a detached tool PID */
+            ownerPid?: number;
+            /** @description Foreground settlement: requested, acknowledged, verified, or unverified. Not evidence of detached tool or cross-host inactivity. */
+            cleanupStatus?: string;
+            cleanupAcknowledged?: boolean;
+            cleanupInterrupted?: boolean;
+            cleanupInterruptError?: string;
+            cleanupIdleError?: string;
             state: components["schemas"]["AgentSessionState"];
             lastError?: string;
             usage?: components["schemas"]["AgentUsage"];

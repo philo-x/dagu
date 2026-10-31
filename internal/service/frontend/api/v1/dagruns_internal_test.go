@@ -1841,6 +1841,31 @@ func TestAgentRestartFinishedChild(t *testing.T) {
 	assert.True(t, f.recorder.dispatched[0].PreviousStatus.Resume)
 }
 
+func TestAgentRestartFencedEndpoint(t *testing.T) {
+	for _, child := range []bool{false, true} {
+		t.Run(fmt.Sprintf("child=%t", child), func(t *testing.T) {
+			f := newAgentResumeFixture(t, child, false)
+			f.status.Status = ir.Failed
+			f.status.Nodes = f.status.Nodes[:1]
+			node := f.status.Nodes[0]
+			node.Status = ir.NodeFailed
+			node.Error = "cancelled with uncertain owner"
+			node.ChatMessages = []ir.LLMMessage{{Content: "retained transcript"}}
+			node.AgentSession.Provider = "opencode"
+			node.AgentSession.CleanupStatus = "unverified"
+			before := ir.CloneAgentSession(node.AgentSession)
+			response, err := f.api.restartAgentSession(t.Context(), f.root, f.subRunID, "agent")
+			require.ErrorIs(t, err, ir.ErrAgentCleanupUnverified)
+			require.False(t, response.Resumed)
+			require.Equal(t, agentSessionActionConflict, classifyAgentSessionAction(err))
+			require.Equal(t, before, ir.CloneAgentSession(node.AgentSession))
+			require.Equal(t, "cancelled with uncertain owner", node.Error)
+			require.Equal(t, []ir.LLMMessage{{Content: "retained transcript"}}, node.ChatMessages)
+			require.Empty(t, f.recorder.dispatched)
+		})
+	}
+}
+
 // Agent actions on a run that is still executing must leave it untouched: a
 // resume would start a second execution beside the running sibling step.
 func TestAgentActionWhileRunning(t *testing.T) {
@@ -1928,6 +1953,8 @@ func TestApplyAgentSessionRestart(t *testing.T) {
 		AgentSession: &ir.AgentSession{
 			Provider: "opencode", SessionID: "session-old", Generation: 2,
 			OwnerWorkerID: "worker-a", State: ir.AgentSessionUnavailable, PromptSent: true, SessionOwned: true,
+			// This restart contract requires positive settlement of the unavailable owner.
+			CleanupStatus:   "verified",
 			PromptMessageID: "message-old", Usage: ir.AgentUsage{TotalTokens: 100},
 			Interactions:     []ir.AgentInteraction{{ID: "old"}},
 			PermissionGrants: []ir.AgentPermissionGrant{{Permission: "bash", Patterns: []string{"git *"}}},
@@ -1952,6 +1979,22 @@ func TestApplyAgentSessionRestart(t *testing.T) {
 	assert.Empty(t, node.ChatMessages)
 }
 
+func TestAgentRestartCleanupFence(t *testing.T) {
+	for _, cleanup := range []string{"requested", "acknowledged", "unverified"} {
+		t.Run(cleanup, func(t *testing.T) {
+			node := &ir.Node{Status: ir.NodeFailed, Error: "original cancellation", ChatMessages: []ir.LLMMessage{{Content: "original transcript"}}, AgentSession: &ir.AgentSession{Provider: "opencode", Generation: 7, SessionID: "ses_original", PromptSent: true, CleanupStatus: cleanup}}
+			before := ir.CloneAgentSession(node.AgentSession)
+			err := applyAgentSessionRestart(node)
+			require.ErrorIs(t, err, ir.ErrAgentCleanupUnverified)
+			require.Equal(t, agentSessionActionConflict, classifyAgentSessionAction(err))
+			require.Equal(t, before, ir.CloneAgentSession(node.AgentSession))
+			require.Equal(t, ir.NodeFailed, node.Status)
+			require.Equal(t, "original cancellation", node.Error)
+			require.Equal(t, []ir.LLMMessage{{Content: "original transcript"}}, node.ChatMessages)
+		})
+	}
+}
+
 func TestApplyAgentSessionRestartAfterCompletion(t *testing.T) {
 	t.Parallel()
 
@@ -1967,6 +2010,30 @@ func TestApplyAgentSessionRestartAfterCompletion(t *testing.T) {
 	assert.Equal(t, ir.NodeNotStarted, node.Status)
 	assert.True(t, node.AgentSession.RestartPending)
 	assert.Equal(t, "session-old", node.AgentSession.DiscardedSessionID)
+}
+
+func TestAgentSessionRestartLegacyFence(t *testing.T) {
+	for _, state := range []ir.AgentSessionState{ir.AgentSessionFailed, ir.AgentSessionAborted, ir.AgentSessionUnavailable} {
+		t.Run(string(state), func(t *testing.T) {
+			node := &ir.Node{
+				Status: ir.NodeFailed, Error: "original failure", ChatMessages: []ir.LLMMessage{{Content: "retained transcript"}},
+				AgentSession: &ir.AgentSession{Provider: "opencode", SessionID: "ses_original", Generation: 7, PromptSent: true, HostInstanceID: "original-host", OwnerWorkerID: "worker", Directory: "/workspace", OwnerPID: 123, State: state},
+			}
+			before := ir.CloneAgentSession(node.AgentSession)
+			err := applyAgentSessionRestart(node)
+			require.Equal(t, before, ir.CloneAgentSession(node.AgentSession))
+			require.ErrorIs(t, err, ir.ErrAgentCleanupUnverified)
+			require.Equal(t, agentSessionActionConflict, classifyAgentSessionAction(err))
+			require.Equal(t, ir.NodeFailed, node.Status)
+			require.Equal(t, "original failure", node.Error)
+			require.Equal(t, []ir.LLMMessage{{Content: "retained transcript"}}, node.ChatMessages)
+			node.AgentSession.CleanupStatus = "verified"
+			require.NoError(t, applyAgentSessionRestart(node))
+			require.Equal(t, 8, node.AgentSession.Generation)
+			require.Empty(t, node.AgentSession.SessionID)
+			require.Equal(t, ir.NodeNotStarted, node.Status)
+		})
+	}
 }
 
 func TestValidateAgentQuestionResponse(t *testing.T) {

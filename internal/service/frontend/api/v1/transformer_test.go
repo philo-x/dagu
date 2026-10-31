@@ -986,3 +986,12 @@ func TestToDAGRunDetailsOmitsProcessForRemoteRun(t *testing.T) {
 
 	assert.Nil(t, details.Process)
 }
+
+func TestAgentCleanupDTO(t *testing.T) {
+	session := &ir.AgentSession{Provider: "opencode", State: ir.AgentSessionAborted, SessionID: "ses_original", CleanupStatus: "unverified", CleanupAcknowledged: true, CleanupInterrupted: true, CleanupInterruptError: "interrupt error", CleanupIdleError: "idle error", OwnerPID: 123, HostInstanceID: "host-original", OwnerWorkerID: "worker-original", Directory: "/workspace"}
+	encoded, err := json.Marshal(toAgentSession(session))
+	require.NoError(t, err)
+	for _, field := range []string{`"cleanupStatus":"unverified"`, `"cleanupAcknowledged":true`, `"cleanupInterrupted":true`, `"cleanupInterruptError":"interrupt error"`, `"cleanupIdleError":"idle error"`, `"ownerPid":123`, `"hostInstanceId":"host-original"`, `"ownerWorkerId":"worker-original"`, `"directory":"/workspace"`} {
+		require.Contains(t, string(encoded), field)
+	}
+}

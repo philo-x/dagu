@@ -3,6 +3,11 @@
 
 package ir
 
+import "errors"
+
+// ErrAgentCleanupUnverified prevents execution while the prior owner may still be active.
+var ErrAgentCleanupUnverified = errors.New("managed agent cleanup is unverified; reconcile the original execution owner before retrying")
+
 // AgentSessionState describes the lifecycle of a managed coding-agent session.
 type AgentSessionState string
 
@@ -153,10 +158,34 @@ type AgentSession struct {
 	Usage              AgentUsage             `json:"usage,omitzero"`
 	Interactions       []AgentInteraction     `json:"interactions,omitempty"`
 	Events             []AgentSessionEvent    `json:"events,omitempty"`
+	// Cleanup describes foreground execution settlement on the owning server,
+	// not detached tools or execution on other servers.
+	CleanupStatus         string `json:"cleanupStatus,omitempty"`
+	CleanupAcknowledged   bool   `json:"cleanupAcknowledged,omitempty"`
+	CleanupInterrupted    bool   `json:"cleanupInterrupted,omitempty"`
+	CleanupInterruptError string `json:"cleanupInterruptError,omitempty"`
+	CleanupIdleError      string `json:"cleanupIdleError,omitempty"`
+	OwnerPID              int    `json:"ownerPid,omitempty"`
+}
+
+// CleanupBlocksExecution retains the owner until cancellation is positively settled.
+func (s *AgentSession) CleanupBlocksExecution() bool {
+	if s == nil || s.CleanupStatus == "verified" {
+		return false
+	}
+	if s.CleanupStatus != "" {
+		return true
+	}
+	// Legacy accepted terminal sessions have no positive owner-settlement evidence.
+	return s.Provider == "opencode" && s.SessionID != "" && s.PromptSent &&
+		(s.State == AgentSessionFailed || s.State == AgentSessionAborted || s.State == AgentSessionUnavailable)
 }
 
 // StartNewGeneration prepares the session to submit its prompt in a new provider session.
 func (s *AgentSession) StartNewGeneration() {
+	if s.CleanupBlocksExecution() {
+		return
+	}
 	if s.Generation < 1 {
 		s.Generation = 1
 	}
@@ -175,6 +204,12 @@ func (s *AgentSession) StartNewGeneration() {
 	s.PermissionGrants = nil
 	s.Interactions = nil
 	s.Usage = AgentUsage{}
+	s.CleanupStatus = ""
+	s.CleanupAcknowledged = false
+	s.CleanupInterrupted = false
+	s.CleanupInterruptError = ""
+	s.CleanupIdleError = ""
+	s.OwnerPID = 0
 }
 
 // CloneAgentSession returns a detached copy safe for runtime handoff.

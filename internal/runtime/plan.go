@@ -530,6 +530,10 @@ func clearNodeForRetry(node *Node, step ir.Step) {
 	if session == nil {
 		return
 	}
+	if session.CleanupBlocksExecution() {
+		node.SetAgentSession(session)
+		return
+	}
 	if session.PromptSent && (previousStatus.IsDone() || session.State == ir.AgentSessionFailed || session.State == ir.AgentSessionAborted) {
 		session.StartNewGeneration()
 	} else {

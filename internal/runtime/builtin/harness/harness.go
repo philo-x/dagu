@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 
@@ -87,6 +88,7 @@ type harnessExecutor struct {
 	agentSession           *ir.AgentSession
 	progressCallback       func()
 	managedHost            opencodehost.Config
+	managedTurn            *managedTurn
 	determinedStatus       ir.NodeStatus
 	hasDeterminedStatus    bool
 
@@ -163,12 +165,25 @@ func (e *harnessExecutor) Stop(intent cmdutil.TerminationIntent) error {
 // stop cancels an ACP turn or forwards the stop request to the active execution backend.
 func (e *harnessExecutor) stop(req cmdutil.StopRequest) error {
 	e.mu.Lock()
-	host := e.managedHost
-	sessionID := ""
-	if e.agentSession != nil {
-		sessionID = e.agentSession.SessionID
+	turn := e.managedTurn
+	cleanupWaiting := false
+	// A local waiting/failure result can close done while its final progress
+	// callback is still running. Closing done alone does not establish settlement.
+	locallyClosed := turn != nil && turn.terminal && turn.submitted && turn.cleanupDeadline.IsZero()
+	if (turn == nil || locallyClosed) && req.Intent.IsTermination() && e.agentSession != nil && e.agentSession.PromptSent &&
+		e.agentSession.SessionID != "" && e.agentSession.State != ir.AgentSessionSucceeded && e.agentSession.CleanupStatus != "verified" && e.managedHost.URL != "" {
+		_, cancel := context.WithCancel(context.Background())
+		turn = &managedTurn{cancel: cancel, done: make(chan struct{}), submitted: true}
+		e.managedTurn = turn
+		e.agentSession.CleanupStatus = "requested"
+		cleanupWaiting = true
 	}
-	workDir := e.workDir
+	if turn != nil && req.Intent.IsTermination() && turn.cleanupDeadline.IsZero() {
+		turn.cleanupDeadline = time.Now().Add(managedCleanupBudget)
+	}
+	if turn != nil && !turn.terminal && req.Intent.IsTermination() {
+		turn.cancel()
+	}
 	if req.Intent.IsTermination() {
 		e.stopRequested = true
 		e.acpStopCode = 143
@@ -184,9 +199,35 @@ func (e *harnessExecutor) stop(req cmdutil.StopRequest) error {
 	cli := e.containerClient
 	containerCancel := e.containerCancel
 	sharedContainerCancel := e.sharedContainerCancel
+	host := e.managedHost
+	session := ir.CloneAgentSession(e.agentSession)
 	e.containerCancel = nil
 	e.sharedContainerCancel = nil
 	e.mu.Unlock()
+	if cleanupWaiting {
+		// One retained turn serializes concurrent Stops; no new persistence worker is created.
+		go func() {
+			client := &openCodeClient{host: host, directory: session.Directory, sessionID: session.SessionID, http: newOpenCodeHTTPClient(managedCleanupBudget)}
+			err := e.reconcileManagedCancellation(client, session.SessionID, turn)
+			e.mu.Lock()
+			turn.cleanupErr = errors.Join(turn.cleanupErr, err)
+			e.agentSession.State = ir.AgentSessionAborted
+			e.agentSession.LastError = errors.Join(context.Canceled, turn.cleanupErr).Error()
+			e.hasDeterminedStatus = false
+			e.mu.Unlock()
+			e.mu.Lock()
+			turn.terminal = true
+			close(turn.done)
+			e.mu.Unlock()
+			turn.cancel()
+			e.notifyProgress()
+			e.mu.Lock()
+			if e.managedTurn == turn {
+				e.managedTurn = nil
+			}
+			e.mu.Unlock()
+		}()
+	}
 
 	if acpCancel != nil && req.Intent.IsTermination() {
 		// A graceful stop lets the agent end its turn; the run escalates to a
@@ -197,8 +238,8 @@ func (e *harnessExecutor) stop(req cmdutil.StopRequest) error {
 		return nil
 	}
 	var stopErr error
-	if host.URL != "" && sessionID != "" {
-		stopErr = abortManagedOpenCode(context.Background(), host, sessionID, workDir)
+	if turn != nil && req.Intent.IsTermination() {
+		stopErr = e.waitManagedStop(turn)
 	}
 	if process != nil {
 		_, err := process.Stop(req)
@@ -257,6 +298,9 @@ func (e *harnessExecutor) effectivePrompt() string {
 
 // Run tries providers in order and publishes only the successful attempt's output.
 func (e *harnessExecutor) Run(ctx context.Context) error {
+	if e.GetAgentSession().CleanupBlocksExecution() {
+		return ir.ErrAgentCleanupUnverified
+	}
 	var lastErr error
 
 	for i, cfg := range e.configs {
@@ -271,6 +315,9 @@ func (e *harnessExecutor) Run(ctx context.Context) error {
 		}
 
 		lastErr = err
+		if errors.Is(err, ir.ErrAgentCleanupUnverified) || e.GetAgentSession().CleanupBlocksExecution() {
+			return err
+		}
 		if cfg.definition != nil && cfg.definition.Protocol == ir.HarnessProtocolACP {
 			e.mu.Lock()
 			stopped, stopCode := e.stopRequested, e.acpStopCode
@@ -281,6 +328,9 @@ func (e *harnessExecutor) Run(ctx context.Context) error {
 				}
 				return err
 			}
+		}
+		if errors.Is(err, context.Canceled) {
+			return err
 		}
 		if ctx.Err() != nil {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {

@@ -650,6 +650,31 @@ Dagu includes built-in actions that run within the Dagu process or on the select
 | `git.checkout` | Clone or update Git repositories |
 | `outputs.write` | Publish DAG or Dagu Action outputs for callers |
 
+### Managed OpenCode cancellation
+
+Monitoring or resume/setup failures after prompt admission retain an unverified
+cleanup fence rather than admitting another turn. Stop also reconciles a session
+waiting for permission or input, including during its final progress notification. Its budget
+includes progress persistence; a deadline fence cannot be cleared by late cleanup.
+The agent-session API exposes cleanup status, acknowledgment, interruption,
+diagnostic errors, and the owning host, worker, process, and directory. A restart
+blocked by cleanup returns a conflict without clearing the transcript or evidence.
+
+Timeouts and Stop cancel the local step independently of remote cleanup. Managed
+OpenCode uses one three-second cleanup budget to request interruption and verify
+idle on the original session owner. V2 interruption sends explicit `resume=false`;
+its acknowledgment alone does not establish settlement. Cleanup events in the
+session timeline report requested, acknowledged, verified, or unverified cleanup.
+
+Unverified cleanup retains the session, generation, directory, host, and worker
+identity and blocks execution, retries, replacement generations, and CLI fallback.
+Legacy accepted failed, aborted, or unavailable sessions without cleanup evidence
+are fenced too. Interruption, verification, and HTTP cleanup errors are preserved
+alongside the original cancellation cause.
+Reconcile the original owner before attempting further work; restarting the step
+is not a cleanup override. Verification covers only the owning OpenCode server
+process's foreground execution, not detached tools or execution on other hosts.
+
 ## Custom Actions
 
 Custom Actions are inline reusable wrappers defined with the top-level `actions` field. They expand to built-in actions during DAG load, so you can wrap a common shell, HTTP, SQL, or other pattern behind a typed interface with validated input.

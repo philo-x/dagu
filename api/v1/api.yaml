@@ -15839,6 +15839,28 @@ components:
           type: string
         variant:
           type: string
+        ownerWorkerId:
+          type: string
+          description: "Worker owning this session's foreground execution"
+        hostInstanceId:
+          type: string
+          description: "Managed host owning this session's foreground execution"
+        directory:
+          type: string
+        ownerPid:
+          type: integer
+          description: "Owning OpenCode server process, not a detached tool PID"
+        cleanupStatus:
+          type: string
+          description: "Foreground settlement: requested, acknowledged, verified, or unverified. Not evidence of detached tool or cross-host inactivity."
+        cleanupAcknowledged:
+          type: boolean
+        cleanupInterrupted:
+          type: boolean
+        cleanupInterruptError:
+          type: string
+        cleanupIdleError:
+          type: string
         state:
           $ref: "#/components/schemas/AgentSessionState"
         lastError:
